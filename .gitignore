@@ -1,0 +1,26 @@
+CHU-TronClassTool-CLI-PublicTEST/
+
+# Virtual environment
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 环境
+.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Cookie 文件
+cookies/

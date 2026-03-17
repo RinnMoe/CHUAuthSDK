@@ -1,5 +1,6 @@
 """
 CHUAuthSDK - CHU统一身份认证核心模块
+1.0.1
 """
 
 import json
@@ -8,6 +9,8 @@ import time
 import base64
 import random
 import logging
+import re
+import getpass
 from typing import Optional, Dict, List, Any
 from io import BytesIO
 
@@ -18,23 +21,37 @@ from Crypto.Util.Padding import pad
 
 from .exceptions import AuthError, CaptchaRequiredError
 
-# 尝试导入tkinter，如果失败则设为None
 try:
-    import tkinter as tk
-    from tkinter import ttk
-    from PIL import Image, ImageTk
-    TKINTER_AVAILABLE = True
+    from PIL import Image
 except ImportError:
-    tk = None  # type: ignore
-    ttk = None  # type: ignore
     Image = None  # type: ignore
-    ImageTk = None  # type: ignore
-    TKINTER_AVAILABLE = False
+
+
+ddddocr = None  # type: ignore
+DDDOCR_AVAILABLE = False
+
+
+def _try_import_ddddocr() -> bool:
+    """尝试导入 ddddocr。"""
+    global ddddocr, DDDOCR_AVAILABLE
+    if DDDOCR_AVAILABLE:
+        return True
+
+    try:
+        import ddddocr as _ddddocr
+        ddddocr = _ddddocr
+        DDDOCR_AVAILABLE = True
+        return True
+    except ImportError:
+        return False
 
 logger = logging.getLogger("CHUAuthSDK")
 
 # 默认配置
 DEFAULT_CAS_URL = "https://ids.chd.edu.cn"
+CAPTCHA_LENGTH = 4
+# 4 位数字和大小写字母
+CAPTCHA_PATTERN = re.compile(r"^[A-Za-z0-9]{4}$")
 
 
 def _random_string(n: int) -> str:
@@ -69,7 +86,10 @@ class CHUAuth:
     def __init__(
         self,
         cas_url: str = DEFAULT_CAS_URL,
-        cookie_dir: Optional[str] = None
+        cookie_dir: Optional[str] = None,
+        enable_ocr: bool = True,
+        headless: bool = False,
+        verbose: bool = False
     ):
         """
         初始化认证客户端
@@ -80,11 +100,27 @@ class CHUAuth:
                         传入目录路径启用持久化，cookie 文件统一存放在该目录下，
                         自动命名为 cookies_{username}.json
                         例如: "cookies" 或 "/path/to/cookies"
+            enable_ocr: 是否优先尝试使用 ddddocr 自动识别验证码
+            headless: 是否禁止任何图形化输入/界面（即使 OCR 失败也不回退）
+            verbose: 是否在需要用户输入验证码时在控制台打印提示信息
         """
         self.cas_url = cas_url.rstrip("/")
         self.cookie_dir = cookie_dir
+        self.enable_ocr = enable_ocr
+        self.headless = headless
+        self.verbose = verbose
         self._session: Optional[requests.Session] = None
         self._current_username: Optional[str] = None
+
+        # 若开启 verbose，则确保 logger 能输出信息；否则保持安静
+        if self.verbose:
+            logger.setLevel(logging.INFO)
+            if not logger.handlers:
+                handler = logging.StreamHandler()
+                handler.setFormatter(logging.Formatter("%(message)s"))
+                logger.addHandler(handler)
+        else:
+            logger.setLevel(logging.WARNING)
     
     @property
     def session(self) -> requests.Session:
@@ -127,12 +163,16 @@ class CHUAuth:
             
             session = requests.Session()
             for c in cookies_list:
-                session.cookies.set(
-                    c.get("name"),
-                    c.get("value"),
-                    domain=c.get("domain"),
-                    path=c.get("path", "/")
-                )
+                name = c.get("name")
+                value = c.get("value")
+                if not name or value is None:
+                    logger.warning("跳过无效 Cookie: %r", c)
+                    continue
+
+                domain = c.get("domain") or None
+                path = c.get("path") or "/"
+                session.cookies.set(name, value, domain=domain, path=path)
+
             logger.debug(f"从 {cookie_file} 加载 Cookies")
             return session
         except Exception as e:
@@ -142,7 +182,6 @@ class CHUAuth:
     def _check_cookies_valid(self, session: requests.Session) -> bool:
         """检查 cookies 是否有效"""
         try:
-            # 用户信息API不包含authserver路径
             resp = session.get(f"{self.cas_url}/personalInfo/common/getUserConf", timeout=10)
             if not resp.ok:
                 return False
@@ -182,75 +221,84 @@ class CHUAuth:
             return None
     
     def _show_captcha_window(self, captcha_image: bytes) -> Optional[str]:
-        """
-        显示验证码窗口
-        
+        """保存验证码图片并通过命令行提示用户查看后输入。
+
         Args:
             captcha_image: 验证码图片数据
-            
+
         Returns:
-            用户输入的验证码，如果用户取消则返回None
+            用户输入的验证码，或用户未输入时返回 None
         """
-        if not TKINTER_AVAILABLE:
-            logger.warning("tkinter或PIL不可用，无法显示验证码窗口")
+        if Image is None:
+            logger.warning("Pillow 未安装，无法保存验证码图片")
             return None
-        
-        captcha_text = None
-        
-        def on_submit():
-            nonlocal captcha_text
-            captcha_text = entry.get().strip()
-            root.destroy()
-        
-        def on_cancel():
-            nonlocal captcha_text
-            captcha_text = None
-            root.destroy()
-        
-        # 创建窗口
-        root = tk.Tk()  # type: ignore[union-attr]
-        root.title("请输入验证码")
-        root.geometry("300x200")
-        root.resizable(False, False)
-        
-        # 居中显示
-        root.eval('tk::PlaceWindow . center')
-        
-        # 显示验证码图片
+
+        file_path = os.path.abspath("captcha.png")
         try:
-            image = Image.open(BytesIO(captcha_image))  # type: ignore[union-attr]
-            photo = ImageTk.PhotoImage(image)  # type: ignore[union-attr]
-            
-            image_label = ttk.Label(root, image=photo)  # type: ignore[union-attr]
-            image_label.image = photo  # type: ignore[attr-defined]  # 保持引用
-            image_label.pack(pady=10)
+            image = Image.open(BytesIO(captcha_image))  # type: ignore
+            image.save(file_path)
+            logger.info(f"验证码已保存到 {file_path}")
         except Exception as e:
-            logger.error(f"显示验证码图片失败: {e}")
-            ttk.Label(root, text="无法显示验证码图片").pack(pady=10)  # type: ignore[union-attr]
-        
-        # 输入框
-        entry_frame = ttk.Frame(root)  # type: ignore[union-attr]
-        entry_frame.pack(pady=5)
-        
-        ttk.Label(entry_frame, text="验证码:").pack(side=tk.LEFT, padx=5)  # type: ignore[union-attr]
-        entry = ttk.Entry(entry_frame, width=15)  # type: ignore[union-attr]
-        entry.pack(side=tk.LEFT, padx=5)  # type: ignore[union-attr]
-        entry.focus()
-        
-        # 按钮
-        button_frame = ttk.Frame(root)  # type: ignore[union-attr]
-        button_frame.pack(pady=10)
-        
-        ttk.Button(button_frame, text="确定", command=on_submit).pack(side=tk.LEFT, padx=5)  # type: ignore[union-attr]
-        ttk.Button(button_frame, text="取消", command=on_cancel).pack(side=tk.LEFT, padx=5)  # type: ignore[union-attr]
-        
-        # 绑定回车键
-        entry.bind('<Return>', lambda e: on_submit())
-        
-        # 运行窗口
-        root.mainloop()
-        
-        return captcha_text
+            logger.warning(f"保存验证码图片失败: {e}")
+            return None
+
+        prompt = f"请查看验证码图片并输入验证码（文件: {file_path}）: "
+        code = input(prompt).strip()
+
+        if code and not CAPTCHA_PATTERN.match(code):
+            logger.warning("验证码格式不正确（应为 %d 位大小写字母或数字）", CAPTCHA_LENGTH)
+            return None
+
+        # 尝试自动清理验证码文件
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
+
+        return code or None
+    
+    def _recognize_captcha(self, captcha_image: bytes) -> Optional[str]:
+        """尝试使用 dddocr 自动识别验证码（仅限 4 位数字）。"""
+        if not _try_import_ddddocr():
+            return None
+        try:
+            ocr = ddddocr.DdddOcr(show_ad=False) # type: ignore
+            result = None
+
+            if hasattr(ocr, "classification"):
+                result = ocr.classification(captcha_image)
+                logger.debug("OCR 结果原始输出: %s", result)
+            elif hasattr(ocr, "ocr"):
+                ocr_res = ocr.ocr(captcha_image)  # type: ignore
+                logger.debug("OCR 结果原始输出: %s", ocr_res)
+                if isinstance(ocr_res, list) and ocr_res:
+                    first = ocr_res[0]
+                    if isinstance(first, (list, tuple)) and first:
+                        result = first[0]
+                    elif isinstance(first, dict):
+                        result = first.get("text")
+                    else:
+                        result = str(first)
+                else:
+                    result = str(ocr_res)
+
+            if not result:
+                return None
+
+            result = re.sub(r"\s+", "", str(result))
+            if not result:
+                logger.debug("OCR 结果为空")
+                return None
+
+            # 仅接受固定格式验证码（4 位大小写字母或数字）
+            if CAPTCHA_PATTERN.match(result):
+                return result
+
+            logger.info(f"OCR 识别结果不是 4 位大小写字母或数字: {result}")
+        except Exception as e:
+            logger.warning(f"自动识别验证码失败: {e}")
+        return None
     
     def _cas_login(
         self,
@@ -295,14 +343,28 @@ class CHUAuth:
         # 检查验证码
         captcha_image = self._check_captcha(username, session)
         if captcha_image and not captcha:
-            # 尝试使用图形界面显示验证码
-            if TKINTER_AVAILABLE:
+            # 尝试自动识别验证码（可配置）
+            ocr_code = None
+            if self.enable_ocr:
+                ocr_code = self._recognize_captcha(captcha_image)
+                if ocr_code:
+                    logger.info(f"自动识别验证码成功: {ocr_code}")
+                    captcha = ocr_code
+
+            if not captcha:
+                # OCR 失败或未启用
+                if self.headless:
+                    raise AuthError("验证码识别失败，headless 模式下不允许回退")
+
+                # 通过命令行提示用户查看保存的验证码图片并输入
                 captcha = self._show_captcha_window(captcha_image)
                 if captcha is None:
                     raise CaptchaRequiredError(captcha_image)
-            else:
-                raise CaptchaRequiredError(captcha_image)
         
+        # 验证验证码格式（若提供）
+        if captcha and not CAPTCHA_PATTERN.match(captcha):
+            raise AuthError(f"验证码格式不正确，需为 {CAPTCHA_LENGTH} 位数字")
+
         # 加密密码
         encrypted_pwd = _encrypt_password(password, salt)  # type: ignore
         
@@ -412,27 +474,20 @@ class CHUAuth:
         
         # cookies 无效或不存在，需要输入密码
         print("未找到有效 cookies，需要输入密码")
-        password = input("请输入密码: ").strip()
+        password = getpass.getpass("请输入密码: ").strip()
         if not password:
             raise AuthError("密码不能为空")
         
         try:
             return self.login(username, password)
         except CaptchaRequiredError as e:
-            # 尝试使用图形界面显示验证码
-            if TKINTER_AVAILABLE:
-                captcha = self._show_captcha_window(e.captcha_image)
-                if captcha is None:
-                    raise AuthError("用户取消了验证码输入")
-                return self.login(username, password, captcha=captcha)
-            else:
-                # 回退到保存图片文件的方式
-                print("需要验证码，请查看 captcha.png")
-                with open("captcha.png", "wb") as f:
-                    f.write(e.captcha_image)
-                
-                captcha = input("请输入验证码: ").strip()
-                return self.login(username, password, captcha=captcha)
+            if self.headless:
+                raise AuthError("需要验证码，但 headless 模式下不允许图形输入或回退") from e
+
+            captcha = self._show_captcha_window(e.captcha_image)
+            if captcha is None:
+                raise AuthError("用户取消了验证码输入")
+            return self.login(username, password, captcha=captcha)
     
     def login_batch(self, accounts_json: str) -> Dict[str, Any]:
         """
@@ -492,7 +547,9 @@ class CHUAuth:
             logger.info(f"正在登录账号 {i+1}/{len(accounts)}: {username}")
             
             try:
-                session = self.login(username, password)
+                # 批量登录不改变当前实例的登录状态，只按账号创建独立会话
+                session = self._cas_login(username, password)
+                self._save_cookies(session, username)
                 results[username] = {
                     "success": True,
                     "session": session,

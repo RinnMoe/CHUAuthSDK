@@ -1,5 +1,3 @@
-CHU-TronClassTool-CLI-PublicTEST/
-
 # Virtual environment
 venv/
 
@@ -24,3 +22,5 @@ venv/
 
 # Cookie 文件
 cookies/
+*.png
+*_test.py

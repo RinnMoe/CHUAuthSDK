@@ -1,6 +1,6 @@
 """
 CHUAuthSDK - CHU统一身份认证核心模块
-1.0.1
+v1.0.1
 """
 
 import json
@@ -47,10 +47,8 @@ def _try_import_ddddocr() -> bool:
 
 logger = logging.getLogger("CHUAuthSDK")
 
-# 默认配置
 DEFAULT_CAS_URL = "https://ids.chd.edu.cn"
 CAPTCHA_LENGTH = 4
-# 4 位数字和大小写字母
 CAPTCHA_PATTERN = re.compile(r"^[A-Za-z0-9]{4}$")
 
 
@@ -259,7 +257,7 @@ class CHUAuth:
         return code or None
     
     def _recognize_captcha(self, captcha_image: bytes) -> Optional[str]:
-        """尝试使用 dddocr 自动识别验证码（仅限 4 位数字）。"""
+        """尝试 dddocr 自动识别验证码"""
         if not _try_import_ddddocr():
             return None
         try:
@@ -291,7 +289,6 @@ class CHUAuth:
                 logger.debug("OCR 结果为空")
                 return None
 
-            # 仅接受固定格式验证码（4 位大小写字母或数字）
             if CAPTCHA_PATTERN.match(result):
                 return result
 
